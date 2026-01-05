@@ -106,19 +106,16 @@ def optimize_portfolio_weights_vectorized(mean_returns, cov_matrix, n_assets, mi
     """
     Vectorized portfolio optimization - much faster
     """
-    # Pre-allocate arrays
-    results = np.zeros((3, n_portfolios))
-    valid_weights = []
-    
     # Risk-free rate
     rf_monthly = 0.068 / 12
     
     # Generate all random weights at once
+    np.random.seed(42)  # For reproducibility
     weights_matrix = np.random.random((n_portfolios, n_assets))
     weights_matrix = weights_matrix / weights_matrix.sum(axis=1, keepdims=True)
     
-    # Apply constraints vectorized
-    weights_matrix = np.clip(weights_matrix, min_weight, None)
+    # Apply minimum weight constraint
+    weights_matrix = np.maximum(weights_matrix, min_weight)
     weights_matrix = weights_matrix / weights_matrix.sum(axis=1, keepdims=True)
     
     # Filter by max weight constraint
@@ -126,17 +123,28 @@ def optimize_portfolio_weights_vectorized(mean_returns, cov_matrix, n_assets, mi
     weights_matrix = weights_matrix[valid_mask]
     
     if len(weights_matrix) == 0:
-        # Fallback to equal weights
-        return np.ones(n_assets) / n_assets
+        # Fallback: try equal weights if within constraints
+        equal_weight = 1.0 / n_assets
+        if min_weight <= equal_weight <= max_weight:
+            return np.ones(n_assets) / n_assets
+        # Otherwise, use proportional weights respecting min constraint
+        base_weights = np.ones(n_assets) * min_weight
+        remaining = 1.0 - (min_weight * n_assets)
+        if remaining > 0:
+            base_weights[0] += remaining  # Add remaining to first stock
+        return base_weights / base_weights.sum()
     
     # Vectorized portfolio calculations
     portfolio_returns = weights_matrix @ mean_returns
     portfolio_variance = np.sum((weights_matrix @ cov_matrix) * weights_matrix, axis=1)
     portfolio_std = np.sqrt(portfolio_variance)
     
+    # Avoid division by zero
+    portfolio_std = np.maximum(portfolio_std, 1e-10)
+    
     # Sharpe ratios
     sharpe_ratios = (portfolio_returns - rf_monthly) / portfolio_std
-    sharpe_ratios = np.nan_to_num(sharpe_ratios, nan=0.0, posinf=0.0, neginf=0.0)
+    sharpe_ratios = np.nan_to_num(sharpe_ratios, nan=-999.0, posinf=-999.0, neginf=-999.0)
     
     # Find maximum Sharpe ratio
     max_sharpe_idx = np.argmax(sharpe_ratios)
@@ -148,6 +156,10 @@ def calculate_portfolio_metrics_fast(returns, weights):
     """Optimized portfolio metrics calculation"""
     # Portfolio returns - vectorized
     portfolio_returns = returns @ weights
+    
+    # Check if we have valid returns
+    if len(portfolio_returns) == 0 or portfolio_returns.std() == 0:
+        return None
     
     # Cumulative returns
     cumulative_returns = (1 + portfolio_returns).cumprod()
@@ -190,25 +202,24 @@ def calculate_portfolio_metrics_fast(returns, weights):
         'cumulative_returns': cumulative_returns
     }
 
-def optimize_single_portfolio(combo, returns_array, mean_returns, cov_matrix, column_names, min_weight, max_weight):
+def optimize_single_portfolio(args):
     """Optimize a single portfolio combination - for parallel processing"""
+    combo, returns_df, min_weight, max_weight = args
     try:
-        # Get column indices for this combination
-        indices = [column_names.index(stock) for stock in combo]
+        # Get subset of returns for this combination
+        combo_returns = returns_df[list(combo)]
         
-        # Subset the data
-        combo_mean_returns = mean_returns[indices]
-        combo_cov = cov_matrix[np.ix_(indices, indices)]
-        combo_returns = returns_array[:, indices]
+        # Calculate statistics
+        combo_mean_returns = combo_returns.mean().values
+        combo_cov = combo_returns.cov().values
         
         # Optimize weights
         weights = optimize_portfolio_weights_vectorized(
             combo_mean_returns, combo_cov, len(combo), min_weight, max_weight
         )
         
-        # Calculate metrics using pandas for this subset
-        combo_returns_df = pd.DataFrame(combo_returns, columns=combo, index=returns_array.index)
-        metrics = calculate_portfolio_metrics_fast(combo_returns_df, weights)
+        # Calculate metrics
+        metrics = calculate_portfolio_metrics_fast(combo_returns, weights)
         
         # Store results
         result = {
@@ -218,6 +229,7 @@ def optimize_single_portfolio(combo, returns_array, mean_returns, cov_matrix, co
         }
         return result
     except Exception as e:
+        print(f"Error optimizing {combo}: {str(e)}")
         return None
 
 def find_best_portfolios_parallel(returns, n_stocks=3, top_n=5, min_weight=0.1, max_weight=1.0):
@@ -228,50 +240,46 @@ def find_best_portfolios_parallel(returns, n_stocks=3, top_n=5, min_weight=0.1, 
     
     st.info(f"🔍 Analyzing {n_combinations} possible combinations of {n_stocks} stocks using parallel processing...")
     
-    # Pre-calculate for all stocks (much faster)
-    returns_array = returns.values
-    mean_returns = returns.mean().values
-    cov_matrix = returns.cov().values
-    column_names = list(returns.columns)
-    
-    # Add index to returns array for later use
-    returns.index = returns.index
-    
     results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # Prepare arguments for parallel processing
+    args_list = [(combo, returns, min_weight, max_weight) for combo in combinations_list]
     
     # Batch processing for better performance
     batch_size = 50
     completed = 0
     
-    for i in range(0, n_combinations, batch_size):
-        batch = combinations_list[i:i+batch_size]
+    for i in range(0, len(args_list), batch_size):
+        batch = args_list[i:i+batch_size]
         
         # Process batch in parallel
-        with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
-            futures = []
-            for combo in batch:
-                future = executor.submit(
-                    optimize_single_portfolio,
-                    combo, returns, mean_returns, cov_matrix, column_names, min_weight, max_weight
-                )
-                futures.append(future)
+        with ThreadPoolExecutor(max_workers=min(mp.cpu_count(), 8)) as executor:
+            futures = [executor.submit(optimize_single_portfolio, args) for args in batch]
             
             # Collect results
             for future in as_completed(futures):
-                result = future.result()
-                if result is not None:
-                    results.append(result)
+                try:
+                    result = future.result()
+                    if result is not None and not np.isnan(result['sharpe_ratio']):
+                        results.append(result)
+                except Exception as e:
+                    print(f"Error in future: {str(e)}")
+                
                 completed += 1
                 
                 # Update progress
                 if completed % 10 == 0 or completed == n_combinations:
-                    status_text.text(f"Optimized {completed}/{n_combinations} portfolios...")
-                    progress_bar.progress(completed / n_combinations)
+                    status_text.text(f"Optimized {completed}/{n_combinations} portfolios... Found {len(results)} valid portfolios")
+                    progress_bar.progress(min(completed / n_combinations, 1.0))
     
     progress_bar.empty()
     status_text.empty()
+    
+    if len(results) == 0:
+        st.error(f"❌ No valid portfolios found. This might be due to constraints being too strict or insufficient data.")
+        return []
     
     # Sort by Sharpe ratio
     results.sort(key=lambda x: x['sharpe_ratio'], reverse=True)
